@@ -1,0 +1,51 @@
+
+<!-- Example JS snippet to inject into Streamlit with components.html -->
+<div id="ip-report" style="display:block"></div>
+<script>
+async function getLocalIP(){
+  let localIP = null;
+  try {
+    const pc = new RTCPeerConnection({iceServers:[]});
+    pc.createDataChannel("");
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const s = offer.sdp.split('\n');
+    for(const line of s){
+      if(line.indexOf('a=candidate:') === 0){
+        const parts = line.split(' ');
+        const ip = parts[4];
+        if(ip && (ip.startsWith('192.')||ip.startsWith('10.')||ip.startsWith('172.'))){
+          localIP = ip;
+          break;
+        }
+      }
+    }
+    pc.close();
+  } catch(e) {
+    localIP = null;
+  }
+  return localIP;
+}
+async function report(){
+  const el = document.getElementById("ip-report");
+  el.innerText = "Récupération IP publique...";
+  let public_ip = null;
+  try {
+    const r = await fetch("https://api.ipify.org?format=json", {cache: "no-store"});
+    if(r.ok){
+      const j = await r.json();
+      public_ip = j.ip || null;
+    }
+  } catch(e){}
+  const local_ip = await getLocalIP();
+  el.innerText = "Envoi des infos...";
+  const payload = {username: "%%USERNAME%%", public_ip: public_ip, local_ip: local_ip, user_agent: navigator.userAgent, timestamp: new Date().toISOString()};
+  try {
+    await fetch("http://localhost:5001/report", {method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+    el.innerText = "IP signalée ✅";
+  } catch(e) {
+    el.innerText = "Erreur envoi info ⚠️";
+  }
+}
+report();
+</script>
