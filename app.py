@@ -1,13 +1,18 @@
 
 import streamlit as st
-import sqlite3
-import hashlib
+import sqlite3, hashlib, base64, requests, os
 from datetime import datetime
 from pathlib import Path
 
-# --- Place always the DB next to this file ---
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "comptes.db"
+
+# ---- GitHub config via secrets ----
+GH_TOKEN  = st.secrets.get("GH_TOKEN", "")
+GH_REPO   = st.secrets.get("GH_REPO", "")          # e.g. "username/mon-repo"
+GH_BRANCH = st.secrets.get("GH_BRANCH", "main")
+GH_PATH   = st.secrets.get("GH_PATH", "comptes.db")  # path/filename in repo
+GH_API    = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}" if GH_REPO else ""
 
 def get_conn():
     return sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
@@ -40,7 +45,12 @@ def creer_compte(username: str, password: str, role: str = "user"):
                 (username.strip(), hasher_mot_de_passe(password), role, datetime.utcnow().isoformat()),
             )
             conn.commit()
-        return True, "Compte créé ✅"
+        # After successful insert, push DB to GitHub (if configured)
+        pushed, detail = upload_db_to_github()
+        if pushed:
+            return True, "Compte créé ✅ (BDD poussée sur GitHub)"
+        else:
+            return True, f"Compte créé ✅ (⚠️ push GitHub non effectué : {detail})"
     except sqlite3.IntegrityError:
         return False, "Ce nom d'utilisateur existe déjà."
 
@@ -62,7 +72,47 @@ def get_all_users():
         cur = conn.execute("SELECT id, nom_utilisateur, role, created_at FROM comptes ORDER BY id")
         return cur.fetchall()
 
-st.set_page_config(page_title="Login simple", layout="centered")
+def upload_db_to_github():
+    """Push comptes.db to GitHub using the Contents API.
+    Requires GH_TOKEN, GH_REPO, GH_BRANCH, GH_PATH in st.secrets.
+    Returns (ok: bool, message: str)
+    """
+    if not (GH_TOKEN and GH_REPO):
+        return False, "GH_TOKEN/GH_REPO non configurés"
+    headers = {
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    # 1) Get current SHA if file exists
+    sha = None
+    get_resp = requests.get(GH_API, headers=headers)
+    if get_resp.status_code == 200:
+        try:
+            sha = get_resp.json().get("sha")
+        except Exception:
+            sha = None
+    elif get_resp.status_code not in (404,):
+        return False, f"GET:{get_resp.status_code} {get_resp.text[:200]}"
+    # 2) Read DB bytes
+    try:
+        with open(DB_PATH, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode()
+    except FileNotFoundError:
+        return False, "comptes.db introuvable"
+    # 3) Put (create/update) file
+    data = {
+        "message": f"update {GH_PATH} ({datetime.utcnow().isoformat()}Z)",
+        "content": content_b64,
+        "branch": GH_BRANCH,
+    }
+    if sha:
+        data["sha"] = sha
+    put_resp = requests.put(GH_API, headers=headers, json=data)
+    if put_resp.status_code in (200, 201):
+        return True, "Poussé"
+    return False, f"PUT:{put_resp.status_code} {put_resp.text[:200]}"
+
+st.set_page_config(page_title="Login + Sync GitHub", layout="centered")
 init_db()
 
 if "connecte" not in st.session_state:
@@ -72,17 +122,20 @@ if "utilisateur" not in st.session_state:
 if "role" not in st.session_state:
     st.session_state.role = None
 
-st.title("🔐 Auth minimale (Streamlit + SQLite)")
+st.title("🔐 Auth + Sync GitHub (SQLite)")
 
-# --- Debug panel to verify DB path & users ---
-with st.expander("🧰 Debug (chemin DB & utilisateurs)"):
-    st.code(f"DB_PATH = {DB_PATH.as_posix()}")
-    users = get_all_users()
-    if users:
-        st.write("Utilisateurs existants :")
-        st.table(users)
-    else:
-        st.info("Aucun utilisateur pour l'instant.")
+# ---- Debug / config ----
+with st.expander("🧰 Debug & Config GitHub"):
+    st.write({
+        "DB_PATH": DB_PATH.as_posix(),
+        "GH_REPO": GH_REPO,
+        "GH_BRANCH": GH_BRANCH,
+        "GH_PATH": GH_PATH,
+        "GH_TOKEN_present": bool(GH_TOKEN),
+    })
+    if st.button("🔄 Forcer push BDD sur GitHub maintenant"):
+        ok, msg = upload_db_to_github()
+        st.write("Résultat push:", ok, msg)
 
 if not st.session_state.connecte:
     tab_login, tab_register = st.tabs(["Se connecter", "Créer un compte"])
