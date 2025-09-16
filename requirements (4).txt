@@ -1,0 +1,3 @@
+# Minimal deps for this app
+streamlit>=1.36,<2.0
+# sqlite3 est dans la bibliothèque standard de Python (pas besoin de lister)
