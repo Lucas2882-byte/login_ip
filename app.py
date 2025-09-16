@@ -1,18 +1,20 @@
 
 import streamlit as st
-import sqlite3, hashlib, base64, requests, os
+import sqlite3, hashlib, base64, requests
 from datetime import datetime
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "comptes.db"
 
-# ---- GitHub config via secrets ----
+# ---- GitHub config (preconfigured) ----
+GH_REPO   = "Lucas2882-byte/login_ip"    # <-- votre dépôt
+GH_BRANCH = "main"                       # <-- branche
+GH_PATH   = "comptes.db"                 # <-- chemin/fichier dans le repo
+GH_API    = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
+
+# Token via secrets uniquement (sécurité)
 GH_TOKEN  = st.secrets.get("GH_TOKEN", "")
-GH_REPO   = st.secrets.get("GH_REPO", "")          # e.g. "username/mon-repo"
-GH_BRANCH = st.secrets.get("GH_BRANCH", "main")
-GH_PATH   = st.secrets.get("GH_PATH", "comptes.db")  # path/filename in repo
-GH_API    = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}" if GH_REPO else ""
 
 def get_conn():
     return sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
@@ -45,7 +47,7 @@ def creer_compte(username: str, password: str, role: str = "user"):
                 (username.strip(), hasher_mot_de_passe(password), role, datetime.utcnow().isoformat()),
             )
             conn.commit()
-        # After successful insert, push DB to GitHub (if configured)
+        # Push GitHub après création
         pushed, detail = upload_db_to_github()
         if pushed:
             return True, "Compte créé ✅ (BDD poussée sur GitHub)"
@@ -73,17 +75,13 @@ def get_all_users():
         return cur.fetchall()
 
 def upload_db_to_github():
-    """Push comptes.db to GitHub using the Contents API.
-    Requires GH_TOKEN, GH_REPO, GH_BRANCH, GH_PATH in st.secrets.
-    Returns (ok: bool, message: str)
-    """
-    if not (GH_TOKEN and GH_REPO):
-        return False, "GH_TOKEN/GH_REPO non configurés"
+    if not GH_TOKEN:
+        return False, "GH_TOKEN manquant dans les secrets"
     headers = {
         "Authorization": f"Bearer {GH_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
-    # 1) Get current SHA if file exists
+    # 1) Récupérer SHA (si le fichier existe déjà)
     sha = None
     get_resp = requests.get(GH_API, headers=headers)
     if get_resp.status_code == 200:
@@ -93,13 +91,13 @@ def upload_db_to_github():
             sha = None
     elif get_resp.status_code not in (404,):
         return False, f"GET:{get_resp.status_code} {get_resp.text[:200]}"
-    # 2) Read DB bytes
+    # 2) Lire la DB
     try:
         with open(DB_PATH, "rb") as f:
             content_b64 = base64.b64encode(f.read()).decode()
     except FileNotFoundError:
         return False, "comptes.db introuvable"
-    # 3) Put (create/update) file
+    # 3) Créer/MàJ
     data = {
         "message": f"update {GH_PATH} ({datetime.utcnow().isoformat()}Z)",
         "content": content_b64,
@@ -112,7 +110,7 @@ def upload_db_to_github():
         return True, "Poussé"
     return False, f"PUT:{put_resp.status_code} {put_resp.text[:200]}"
 
-st.set_page_config(page_title="Login + Sync GitHub", layout="centered")
+st.set_page_config(page_title="Login + Sync GitHub (préconfiguré)", layout="centered")
 init_db()
 
 if "connecte" not in st.session_state:
@@ -122,9 +120,8 @@ if "utilisateur" not in st.session_state:
 if "role" not in st.session_state:
     st.session_state.role = None
 
-st.title("🔐 Auth + Sync GitHub (SQLite)")
+st.title("🔐 Auth + Sync GitHub (SQLite) — préconfiguré")
 
-# ---- Debug / config ----
 with st.expander("🧰 Debug & Config GitHub"):
     st.write({
         "DB_PATH": DB_PATH.as_posix(),
