@@ -3,11 +3,14 @@ import streamlit as st
 import sqlite3
 import hashlib
 from datetime import datetime
+from pathlib import Path
 
-DB_PATH = "comptes.db"
+# --- Place always the DB next to this file ---
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "comptes.db"
 
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    return sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
 
 def init_db():
     with get_conn() as conn:
@@ -54,6 +57,11 @@ def verifier_utilisateur(username: str, password: str):
     ok = (hasher_mot_de_passe(password) == hash_stocke)
     return ok, (role if ok else None)
 
+def get_all_users():
+    with get_conn() as conn:
+        cur = conn.execute("SELECT id, nom_utilisateur, role, created_at FROM comptes ORDER BY id")
+        return cur.fetchall()
+
 st.set_page_config(page_title="Login simple", layout="centered")
 init_db()
 
@@ -65,6 +73,16 @@ if "role" not in st.session_state:
     st.session_state.role = None
 
 st.title("🔐 Auth minimale (Streamlit + SQLite)")
+
+# --- Debug panel to verify DB path & users ---
+with st.expander("🧰 Debug (chemin DB & utilisateurs)"):
+    st.code(f"DB_PATH = {DB_PATH.as_posix()}")
+    users = get_all_users()
+    if users:
+        st.write("Utilisateurs existants :")
+        st.table(users)
+    else:
+        st.info("Aucun utilisateur pour l'instant.")
 
 if not st.session_state.connecte:
     tab_login, tab_register = st.tabs(["Se connecter", "Créer un compte"])
@@ -94,6 +112,7 @@ if not st.session_state.connecte:
             else:
                 ok, msg = creer_compte(new_user, new_pwd, role)
                 (st.success if ok else st.error)(msg)
+                st.rerun()
 
 else:
     st.success(f"Connecté en tant que **{st.session_state.utilisateur}** (rôle : **{st.session_state.role}**) ✅")
