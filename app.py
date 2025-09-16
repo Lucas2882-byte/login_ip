@@ -1,8 +1,11 @@
-
+import os
+import base64  # utilisé uniquement pour stocker le hash bcrypt dans la BDD, pas pour GitHub
 import streamlit as st
 import sqlite3
 import bcrypt
 from datetime import datetime
+import subprocess, tempfile, shutil
+from pathlib import Path
 
 DB_PATH = "users.db"
 
@@ -58,19 +61,126 @@ def verify_user(conn, username_or_email: str, password: str):
         return {"id": uid, "username": username, "email": email, "created_at": created_at}
     return None
 
+def seed_from_config(conn):
+    """
+    Optionnel : créer un compte par défaut à partir des secrets/env.
+    Secrets/env attendus : SEED_USERNAME, SEED_EMAIL, SEED_PASSWORD
+    """
+    def get(name, default=None):
+        try:
+            return st.secrets.get(name, None) or os.environ.get(name, default)
+        except Exception:
+            return os.environ.get(name, default)
+
+    su = get("SEED_USERNAME")
+    se = get("SEED_EMAIL")
+    sp = get("SEED_PASSWORD")
+
+    if su and se and sp and not user_exists(conn, su) and not email_exists(conn, se):
+        try:
+            create_user(conn, su, se, sp)
+            st.sidebar.success(f"Seeded default user '{su}'.")
+            ok, msg = push_db_to_github_via_git()
+            st.sidebar.success(msg) if ok else st.sidebar.info(msg)
+        except Exception as e:
+            st.sidebar.warning(f"Seeding failed: {e}")
+
+# ---------- Git sync (sans base64 : via git CLI) ----------
+def _git_cfg():
+    def get(name, default=None):
+        try:
+            return st.secrets.get(name, None) or os.environ.get(name, default)
+        except Exception:
+            return os.environ.get(name, default)
+
+    remote = get("GIT_REMOTE")
+    token = get("GIT_TOKEN")
+    repo  = get("GIT_REPO")  # "owner/repo"
+    branch = get("GIT_BRANCH", "main")
+    path_in_repo = get("GIT_PATH", "users.db")
+    cname = get("GIT_COMMIT_NAME", "streamlit-bot")
+    cemail = get("GIT_COMMIT_EMAIL", "bot@example.com")
+
+    if not remote:
+        if token and repo:
+            remote = f"https://{token}@github.com/{repo}.git"
+    if not remote:
+        return None
+
+    return {
+        "remote": remote, "branch": branch, "path": path_in_repo,
+        "commit_name": cname, "commit_email": cemail
+    }
+
+def _run(cmd, cwd=None):
+    try:
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+def push_db_to_github_via_git():
+    """
+    Clone le repo, copie users.db vers GIT_PATH, commit & push.
+    Nécessite git dans l'environnement et des credentials dans l'URL distante.
+    """
+    cfg = _git_cfg()
+    if not cfg:
+        return False, "GitHub non configuré (GIT_REMOTE ou GIT_TOKEN+GIT_REPO manquants)."
+    if not os.path.exists(DB_PATH):
+        return False, "users.db introuvable."
+
+    tmpdir = tempfile.mkdtemp(prefix="st_git_")
+    try:
+        # git clone
+        code, out, err = _run(["git", "clone", "--depth", "1", "-b", cfg["branch"], cfg["remote"], tmpdir])
+        if code != 0:
+            return False, f"git clone a échoué: {err or out}"
+
+        # config user
+        _run(["git", "config", "user.name", cfg["commit_name"]], cwd=tmpdir)
+        _run(["git", "config", "user.email", cfg["commit_email"]], cwd=tmpdir)
+
+        # copie du fichier
+        dest = Path(tmpdir) / cfg["path"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(DB_PATH, dest)
+
+        # add/commit/push
+        code, out, err = _run(["git", "add", cfg["path"]], cwd=tmpdir)
+        if code != 0:
+            return False, f"git add a échoué: {err or out}"
+
+        msg = "chore(db): update users.db from app"
+        code, out, err = _run(["git", "commit", "-m", msg], cwd=tmpdir)
+        if code != 0:
+            # Rien à committer ?
+            if "nothing to commit" in (out + err).lower():
+                return True, "Aucune modification à pousser."
+            return False, f"git commit a échoué: {err or out}"
+
+        code, out, err = _run(["git", "push", "origin", cfg["branch"]], cwd=tmpdir)
+        if code != 0:
+            return False, f"git push a échoué: {err or out}"
+
+        return True, "BDD poussée sur GitHub (git push)."
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
 # ---------- UI ----------
 st.set_page_config(page_title="Streamlit Auth Demo", page_icon="🔐", layout="centered")
 
-# Simple theming/help card
 with st.sidebar:
     st.title("🔐 Auth Demo")
-    st.write("Login / register example with SQLite + bcrypt.")
-    st.caption("This is a demo. For production, use a managed database and secrets.")
+    st.write("Login / register avec SQLite + bcrypt.")
+    st.caption("Démo. Pour la prod, utilisez une BDD gérée + secrets.")
 
-# Initialize DB connection
 conn = get_conn()
+seed_from_config(conn)
 
-# Session bootstrap
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -78,11 +188,11 @@ def logout():
     st.session_state.user = None
     st.success("Logged out.")
 
-# If logged in, show a simple app page
+# Logged-in
 if st.session_state.user:
     user = st.session_state.user
-    st.success(f"Welcome, **{user['username']}**!")
-    st.write("You're logged in. Here's your profile:")
+    st.success(f"Bienvenue, **{user['username']}** !")
+    st.write("Profil :")
     with st.container(border=True):
         st.write(f"**Username:** {user['username']}")
         st.write(f"**Email:** {user['email']}")
@@ -90,21 +200,16 @@ if st.session_state.user:
     if st.button("Log out", type="primary"):
         logout()
     st.divider()
-    st.write("✅ Protected content goes here.")
+    st.write("✅ Contenu protégé ici.")
 else:
     tabs = st.tabs(["Sign in", "Create account"])
 
-    # Sign in tab
+    # Sign in
     with tabs[0]:
         st.subheader("Sign in")
         si_id = st.text_input("Username or email", key="si_user")
         si_pw = st.text_input("Password", type="password", key="si_pw")
-        col1, col2 = st.columns([1,1])
-        with col1:
-            submit = st.button("Sign in", type="primary")
-        with col2:
-            st.caption("")
-        if submit:
+        if st.button("Sign in", type="primary"):
             if not si_id or not si_pw:
                 st.error("Please fill in both fields.")
             else:
@@ -115,7 +220,7 @@ else:
                 else:
                     st.error("Invalid credentials.")
 
-    # Create account tab
+    # Create account
     with tabs[1]:
         st.subheader("Create account")
         ca_username = st.text_input("Username").strip().lower()
@@ -123,7 +228,6 @@ else:
         ca_pw = st.text_input("Password", type="password")
         ca_pw2 = st.text_input("Confirm password", type="password")
         if st.button("Create account", type="primary"):
-            # Basic validation
             if not ca_username or not ca_email or not ca_pw or not ca_pw2:
                 st.error("All fields are required.")
             elif len(ca_username) < 3:
@@ -141,6 +245,8 @@ else:
             else:
                 try:
                     create_user(conn, ca_username, ca_email, ca_pw)
+                    ok, msg = push_db_to_github_via_git()
+                    st.sidebar.success(msg) if ok else st.sidebar.info(msg)
                     st.success("Account created! You can now sign in.")
                 except sqlite3.IntegrityError:
                     st.error("Username or email already exists.")
