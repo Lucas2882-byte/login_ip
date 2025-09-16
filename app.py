@@ -1,11 +1,12 @@
 import os
-import base64  # utilisé uniquement pour stocker le hash bcrypt dans la BDD, pas pour GitHub
+import base64  # pour stocker le hash bcrypt dans la BDD (pas pour GitHub)
 import streamlit as st
 import sqlite3
 import bcrypt
 from datetime import datetime
 import subprocess, tempfile, shutil
 from pathlib import Path
+from urllib.parse import urlparse, quote
 
 DB_PATH = "users.db"
 
@@ -64,7 +65,7 @@ def verify_user(conn, username_or_email: str, password: str):
 def seed_from_config(conn):
     """
     Optionnel : créer un compte par défaut à partir des secrets/env.
-    Secrets/env attendus : SEED_USERNAME, SEED_EMAIL, SEED_PASSWORD
+    Attendus : SEED_USERNAME, SEED_EMAIL, SEED_PASSWORD
     """
     def get(name, default=None):
         try:
@@ -85,7 +86,7 @@ def seed_from_config(conn):
         except Exception as e:
             st.sidebar.warning(f"Seeding failed: {e}")
 
-# ---------- Git sync (sans base64 : via git CLI) ----------
+# ---------- Git sync (via git CLI, sans base64) ----------
 def _git_cfg():
     def get(name, default=None):
         try:
@@ -94,22 +95,39 @@ def _git_cfg():
             return os.environ.get(name, default)
 
     remote = get("GIT_REMOTE")
-    token = get("GIT_TOKEN")
-    repo  = get("GIT_REPO")  # "owner/repo"
+    token  = get("GIT_TOKEN")
+    repo   = get("GIT_REPO")  # attendu: "owner/repo" (tolère aussi une URL, on normalise)
     branch = get("GIT_BRANCH", "main")
     path_in_repo = get("GIT_PATH", "users.db")
-    cname = get("GIT_COMMIT_NAME", "streamlit-bot")
+    cname  = get("GIT_COMMIT_NAME", "streamlit-bot")
     cemail = get("GIT_COMMIT_EMAIL", "bot@example.com")
 
-    if not remote:
-        if token and repo:
-            remote = f"https://{token}@github.com/{repo}.git"
+    # Si on n’a pas de remote explicite, on le fabrique à partir du token + repo
+    if not remote and token and repo:
+        repostr = repo.strip()
+
+        # Autorise une URL complète dans GIT_REPO et en extrait owner/repo
+        if repostr.startswith(("http://", "https://")):
+            u = urlparse(repostr)
+            repostr = u.path.strip("/")  # ex: "owner/repo" ou "owner/repo.git"
+
+        # Retire un éventuel suffixe .git
+        if repostr.endswith(".git"):
+            repostr = repostr[:-4]
+
+        # Encode le token pour éviter problèmes de caractères spéciaux
+        token_enc = quote(token, safe="")
+        remote = f"https://x-access-token:{token_enc}@github.com/{repostr}.git"
+
     if not remote:
         return None
 
     return {
-        "remote": remote, "branch": branch, "path": path_in_repo,
-        "commit_name": cname, "commit_email": cemail
+        "remote": remote,
+        "branch": branch,
+        "path": path_in_repo,
+        "commit_name": cname,
+        "commit_email": cemail,
     }
 
 def _run(cmd, cwd=None):
@@ -122,7 +140,7 @@ def _run(cmd, cwd=None):
 def push_db_to_github_via_git():
     """
     Clone le repo, copie users.db vers GIT_PATH, commit & push.
-    Nécessite git dans l'environnement et des credentials dans l'URL distante.
+    Nécessite 'git' installé et des credentials dans l'URL distante.
     """
     cfg = _git_cfg()
     if not cfg:
@@ -132,21 +150,26 @@ def push_db_to_github_via_git():
 
     tmpdir = tempfile.mkdtemp(prefix="st_git_")
     try:
-        # git clone
+        # 1) clone sur la branche (avec fallback si la branche n'existe pas encore)
         code, out, err = _run(["git", "clone", "--depth", "1", "-b", cfg["branch"], cfg["remote"], tmpdir])
         if code != 0:
-            return False, f"git clone a échoué: {err or out}"
+            # fallback : clone la branche par défaut puis crée/checkout la branche demandée
+            code2, out2, err2 = _run(["git", "clone", "--depth", "1", cfg["remote"], tmpdir])
+            if code2 != 0:
+                return False, f"git clone a échoué: {err or out or err2 or out2}"
+            _run(["git", "checkout", "-B", cfg["branch"]], cwd=tmpdir)
 
-        # config user
+        # 2) config user
         _run(["git", "config", "user.name", cfg["commit_name"]], cwd=tmpdir)
         _run(["git", "config", "user.email", cfg["commit_email"]], cwd=tmpdir)
+        _run(["git", "config", "--global", "--add", "safe.directory", tmpdir], cwd=tmpdir)
 
-        # copie du fichier
+        # 3) copie du fichier
         dest = Path(tmpdir) / cfg["path"]
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(DB_PATH, dest)
 
-        # add/commit/push
+        # 4) add/commit/push
         code, out, err = _run(["git", "add", cfg["path"]], cwd=tmpdir)
         if code != 0:
             return False, f"git add a échoué: {err or out}"
@@ -154,7 +177,6 @@ def push_db_to_github_via_git():
         msg = "chore(db): update users.db from app"
         code, out, err = _run(["git", "commit", "-m", msg], cwd=tmpdir)
         if code != 0:
-            # Rien à committer ?
             if "nothing to commit" in (out + err).lower():
                 return True, "Aucune modification à pousser."
             return False, f"git commit a échoué: {err or out}"
