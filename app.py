@@ -62,60 +62,34 @@ def verify_user(conn, username_or_email: str, password: str):
         return {"id": uid, "username": username, "email": email, "created_at": created_at}
     return None
 
-def seed_from_config(conn):
-    """
-    Optionnel : créer un compte par défaut à partir des secrets/env.
-    Attendus : SEED_USERNAME, SEED_EMAIL, SEED_PASSWORD
-    """
-    def get(name, default=None):
-        try:
-            return st.secrets.get(name, None) or os.environ.get(name, default)
-        except Exception:
-            return os.environ.get(name, default)
-
-    su = get("SEED_USERNAME")
-    se = get("SEED_EMAIL")
-    sp = get("SEED_PASSWORD")
-
-    if su and se and sp and not user_exists(conn, su) and not email_exists(conn, se):
-        try:
-            create_user(conn, su, se, sp)
-            st.sidebar.success(f"Seeded default user '{su}'.")
-            ok, msg = push_db_to_github_via_git()
-            st.sidebar.success(msg) if ok else st.sidebar.info(msg)
-        except Exception as e:
-            st.sidebar.warning(f"Seeding failed: {e}")
-
 # ---------- Git sync (via git CLI, sans base64) ----------
+def _val(name, default=None):
+    try:
+        return st.secrets.get(name, None) or os.environ.get(name, default)
+    except Exception:
+        return os.environ.get(name, default)
+
 def _git_cfg():
-    def get(name, default=None):
-        try:
-            return st.secrets.get(name, None) or os.environ.get(name, default)
-        except Exception:
-            return os.environ.get(name, default)
+    """
+    On privilégie GIT_REMOTE explicite.
+    Sinon, on construit l'URL via GIT_TOKEN + GIT_REPO, tout en tolérant une URL complète passée dans GIT_REPO.
+    """
+    remote = _val("GIT_REMOTE")
+    token  = _val("GIT_TOKEN")
+    repo   = _val("GIT_REPO")  # attendu: "owner/repo" (tolère une URL, on normalise)
+    branch = _val("GIT_BRANCH", "db-sync")  # branche dédiée par défaut (évite les protections sur main)
+    path_in_repo = _val("GIT_PATH", "users.db")
+    cname  = _val("GIT_COMMIT_NAME", "streamlit-bot")
+    cemail = _val("GIT_COMMIT_EMAIL", "bot@example.com")
 
-    remote = get("GIT_REMOTE")
-    token  = get("GIT_TOKEN")
-    repo   = get("GIT_REPO")  # attendu: "owner/repo" (tolère aussi une URL, on normalise)
-    branch = get("GIT_BRANCH", "main")
-    path_in_repo = get("GIT_PATH", "users.db")
-    cname  = get("GIT_COMMIT_NAME", "streamlit-bot")
-    cemail = get("GIT_COMMIT_EMAIL", "bot@example.com")
-
-    # Si on n’a pas de remote explicite, on le fabrique à partir du token + repo
     if not remote and token and repo:
         repostr = repo.strip()
-
         # Autorise une URL complète dans GIT_REPO et en extrait owner/repo
         if repostr.startswith(("http://", "https://")):
             u = urlparse(repostr)
             repostr = u.path.strip("/")  # ex: "owner/repo" ou "owner/repo.git"
-
-        # Retire un éventuel suffixe .git
         if repostr.endswith(".git"):
             repostr = repostr[:-4]
-
-        # Encode le token pour éviter problèmes de caractères spéciaux
         token_enc = quote(token, safe="")
         remote = f"https://x-access-token:{token_enc}@github.com/{repostr}.git"
 
@@ -132,7 +106,7 @@ def _git_cfg():
 
 def _run(cmd, cwd=None):
     try:
-        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=150)
         return res.returncode, res.stdout.strip(), res.stderr.strip()
     except Exception as e:
         return 1, "", str(e)
@@ -144,22 +118,21 @@ def push_db_to_github_via_git():
     """
     cfg = _git_cfg()
     if not cfg:
-        return False, "GitHub non configuré (GIT_REMOTE ou GIT_TOKEN+GIT_REPO manquants)."
+        return False, "GitHub non configuré (définis GIT_REMOTE ou GIT_TOKEN+GIT_REPO)."
     if not os.path.exists(DB_PATH):
         return False, "users.db introuvable."
 
     tmpdir = tempfile.mkdtemp(prefix="st_git_")
     try:
-        # 1) clone sur la branche (avec fallback si la branche n'existe pas encore)
+        # 1) clone sur la branche demandée (fallback si elle n'existe pas)
         code, out, err = _run(["git", "clone", "--depth", "1", "-b", cfg["branch"], cfg["remote"], tmpdir])
         if code != 0:
-            # fallback : clone la branche par défaut puis crée/checkout la branche demandée
             code2, out2, err2 = _run(["git", "clone", "--depth", "1", cfg["remote"], tmpdir])
             if code2 != 0:
                 return False, f"git clone a échoué: {err or out or err2 or out2}"
             _run(["git", "checkout", "-B", cfg["branch"]], cwd=tmpdir)
 
-        # 2) config user
+        # 2) config user + safe dir
         _run(["git", "config", "user.name", cfg["commit_name"]], cwd=tmpdir)
         _run(["git", "config", "user.email", cfg["commit_email"]], cwd=tmpdir)
         _run(["git", "config", "--global", "--add", "safe.directory", tmpdir], cwd=tmpdir)
@@ -198,10 +171,13 @@ st.set_page_config(page_title="Streamlit Auth Demo", page_icon="🔐", layout="c
 with st.sidebar:
     st.title("🔐 Auth Demo")
     st.write("Login / register avec SQLite + bcrypt.")
+    with st.expander("⚙️ Sync GitHub (test)"):
+        if st.button("Tester le push GitHub"):
+            ok, msg = push_db_to_github_via_git()
+            st.success(msg) if ok else st.error(msg)
     st.caption("Démo. Pour la prod, utilisez une BDD gérée + secrets.")
 
 conn = get_conn()
-seed_from_config(conn)
 
 if "user" not in st.session_state:
     st.session_state.user = None
