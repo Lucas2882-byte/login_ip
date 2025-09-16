@@ -1,4 +1,3 @@
-
 import streamlit as st
 import sqlite3, hashlib, base64, requests
 from datetime import datetime
@@ -47,12 +46,8 @@ def creer_compte(username: str, password: str, role: str = "user"):
                 (username.strip(), hasher_mot_de_passe(password), role, datetime.utcnow().isoformat()),
             )
             conn.commit()
-        # Push GitHub après création
-        pushed, detail = upload_db_to_github()
-        if pushed:
-            return True, "Compte créé ✅ (BDD poussée sur GitHub)"
-        else:
-            return True, f"Compte créé ✅ (⚠️ push GitHub non effectué : {detail})"
+        # on laisse l'autopush se déclencher via le digest juste après
+        return True, "Compte créé ✅"
     except sqlite3.IntegrityError:
         return False, "Ce nom d'utilisateur existe déjà."
 
@@ -73,6 +68,17 @@ def get_all_users():
     with get_conn() as conn:
         cur = conn.execute("SELECT id, nom_utilisateur, role, created_at FROM comptes ORDER BY id")
         return cur.fetchall()
+
+# ---------- Auto-push helpers ----------
+def file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except FileNotFoundError:
+        return ""
 
 def upload_db_to_github():
     if not GH_TOKEN:
@@ -110,17 +116,28 @@ def upload_db_to_github():
         return True, "Poussé"
     return False, f"PUT:{put_resp.status_code} {put_resp.text[:200]}"
 
+# ---------- App ----------
 st.set_page_config(page_title="Login + Sync GitHub (préconfiguré)", layout="centered")
 init_db()
 
+# État session
 if "connecte" not in st.session_state:
     st.session_state.connecte = False
 if "utilisateur" not in st.session_state:
     st.session_state.utilisateur = None
 if "role" not in st.session_state:
     st.session_state.role = None
+if "_last_digest" not in st.session_state:
+    st.session_state._last_digest = file_digest(DB_PATH)
 
 st.title("🔐 Auth + Sync GitHub (SQLite) — préconfiguré")
+
+# --- AUTO-PUSH : si la DB a changé depuis le dernier run, push
+_current_digest = file_digest(DB_PATH)
+if GH_TOKEN and _current_digest and _current_digest != st.session_state._last_digest:
+    ok, msg = upload_db_to_github()
+    st.session_state._last_digest = _current_digest
+    st.toast(f"Sync GitHub: {'✅' if ok else '⚠️'} {msg}")
 
 with st.expander("🧰 Debug & Config GitHub"):
     st.write({
@@ -129,10 +146,13 @@ with st.expander("🧰 Debug & Config GitHub"):
         "GH_BRANCH": GH_BRANCH,
         "GH_PATH": GH_PATH,
         "GH_TOKEN_present": bool(GH_TOKEN),
+        "last_digest": st.session_state._last_digest,
+        "current_digest": _current_digest,
     })
     if st.button("🔄 Forcer push BDD sur GitHub maintenant"):
         ok, msg = upload_db_to_github()
         st.write("Résultat push:", ok, msg)
+        st.session_state._last_digest = file_digest(DB_PATH)
 
 if not st.session_state.connecte:
     tab_login, tab_register = st.tabs(["Se connecter", "Créer un compte"])
@@ -162,6 +182,7 @@ if not st.session_state.connecte:
             else:
                 ok, msg = creer_compte(new_user, new_pwd, role)
                 (st.success if ok else st.error)(msg)
+                # rerun pour que l'auto-push détecte le changement et pousse
                 st.rerun()
 
 else:
